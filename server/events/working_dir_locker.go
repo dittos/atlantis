@@ -38,6 +38,8 @@ type WorkingDirLocker interface {
 	// an error if the workspace is already locked. The error is expected to
 	// be printed to the pull request.
 	TryLockPull(repoFullName string, pullNum int) (func(), error)
+	// 
+	TryLockWithCommit(repoFullName string, pullNum int, pullHeadCommit string, workspace string) (func(), func(), error)
 }
 
 // DefaultWorkingDirLocker implements WorkingDirLocker.
@@ -49,6 +51,8 @@ type DefaultWorkingDirLocker struct {
 	// matching to determine if something is locked. It's naive but that's okay
 	// because there won't be many locks at one time.
 	locks []string
+
+	commitWaitGroupMap map[string]sync.WaitGroup
 }
 
 // NewDefaultWorkingDirLocker is a constructor.
@@ -70,7 +74,7 @@ func (d *DefaultWorkingDirLocker) TryLockPull(repoFullName string, pullNum int) 
 	}
 	d.locks = append(d.locks, pullKey)
 	return func() {
-		d.UnlockPull(repoFullName, pullNum)
+		d.unlockPull(repoFullName, pullNum)
 	}, nil
 }
 
@@ -93,6 +97,50 @@ func (d *DefaultWorkingDirLocker) TryLock(repoFullName string, pullNum int, work
 	}, nil
 }
 
+func (d *DefaultWorkingDirLocker) TryLockWithCommit(repoFullName string, pullNum int, pullHeadCommit string, workspace string) (func(), func(), error) {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+
+	pullKey := d.pullKey(repoFullName, pullNum)
+	workspaceKey := d.workspaceKey(repoFullName, pullNum, workspace)
+	commitKey := d.commitKey(repoFullName, pullNum, pullHeadCommit, workspace)
+	alreadyLocked := false
+	for _, l := range d.locks {
+		alreadyLocked = l == commitKey
+		if alreadyLocked {
+			break
+		}
+		if l == pullKey || strings.HasPrefix(l, workspaceKey + "@") {
+			return func() {}, nil, fmt.Errorf("The %s workspace is currently locked by another"+
+				" command that is running for this pull request.\n"+
+				"Wait until the previous command is complete and try again.", workspace)
+		}
+	}
+	d.locks = append(d.locks, commitKey)
+	if alreadyLocked {
+		wg := d.commitWaitGroupMap[commitKey]
+		return func() {
+			d.unlock(repoFullName, pullNum, workspace)
+		}, func() {
+			wg.Wait()
+		}, nil
+	} else {
+		var wg sync.WaitGroup
+		wg.Add(1)
+		if (d.commitWaitGroupMap == nil) {
+			d.commitWaitGroupMap = make(map[string]sync.WaitGroup)
+		}
+		d.commitWaitGroupMap[commitKey] = wg
+		return func() {
+			d.unlock(repoFullName, pullNum, workspace)
+			wg.Done()
+			d.mutex.Lock()
+			defer d.mutex.Unlock()
+			delete(d.commitWaitGroupMap, commitKey)
+		}, nil, nil
+	}
+}
+
 // Unlock unlocks the workspace for this pull.
 func (d *DefaultWorkingDirLocker) unlock(repoFullName string, pullNum int, workspace string) {
 	d.mutex.Lock()
@@ -103,7 +151,7 @@ func (d *DefaultWorkingDirLocker) unlock(repoFullName string, pullNum int, works
 }
 
 // Unlock unlocks all workspaces for this pull.
-func (d *DefaultWorkingDirLocker) UnlockPull(repoFullName string, pullNum int) {
+func (d *DefaultWorkingDirLocker) unlockPull(repoFullName string, pullNum int) {
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
@@ -111,11 +159,21 @@ func (d *DefaultWorkingDirLocker) UnlockPull(repoFullName string, pullNum int) {
 	d.removeLock(pullKey)
 }
 
+// Unlock unlocks all workspaces for this pull.
+func (d *DefaultWorkingDirLocker) unlockCommit(repoFullName string, pullNum int, pullHeadCommit string, workspace string) {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+
+	commitKey := d.commitKey(repoFullName, pullNum, pullHeadCommit, workspace)
+	d.removeLock(commitKey)
+}
+
 func (d *DefaultWorkingDirLocker) removeLock(key string) {
 	var newLocks []string
 	for _, l := range d.locks {
 		if l != key {
 			newLocks = append(newLocks, l)
+			break
 		}
 	}
 	d.locks = newLocks
@@ -127,4 +185,8 @@ func (d *DefaultWorkingDirLocker) workspaceKey(repo string, pull int, workspace 
 
 func (d *DefaultWorkingDirLocker) pullKey(repo string, pull int) string {
 	return fmt.Sprintf("%s/%d", repo, pull)
+}
+
+func (d *DefaultWorkingDirLocker) commitKey(repo string, pull int, commit string, workspace string) string {
+	return fmt.Sprintf("%s/%s@%s", d.pullKey(repo, pull), workspace, commit)
 }

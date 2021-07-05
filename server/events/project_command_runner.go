@@ -274,19 +274,28 @@ func (p *DefaultProjectCommandRunner) doPlan(ctx models.ProjectCommandContext) (
 	ctx.Log.Debug("acquired lock for project")
 
 	// Acquire internal lock for the directory we're going to operate in.
-	unlockFn, err := p.WorkingDirLocker.TryLock(ctx.Pull.BaseRepo.FullName, ctx.Pull.Num, ctx.Workspace)
+	unlockFn, waitFn, err := p.WorkingDirLocker.TryLockWithCommit(ctx.Pull.BaseRepo.FullName, ctx.Pull.Num, ctx.Pull.HeadCommit, ctx.Workspace)
 	if err != nil {
 		return nil, "", err
 	}
 	defer unlockFn()
 
-	// Clone is idempotent so okay to run even if the repo was already cloned.
-	repoDir, hasDiverged, cloneErr := p.WorkingDir.Clone(ctx.Log, ctx.HeadRepo, ctx.Pull, ctx.Workspace)
-	if cloneErr != nil {
-		if unlockErr := lockAttempt.UnlockFn(); unlockErr != nil {
-			ctx.Log.Err("error unlocking state after plan error: %v", unlockErr)
+	var repoDir string
+	var hasDiverged bool
+	var cloneErr error
+	if waitFn == nil {
+		// Clone is idempotent so okay to run even if the repo was already cloned.
+		repoDir, hasDiverged, cloneErr = p.WorkingDir.Clone(ctx.Log, ctx.HeadRepo, ctx.Pull, ctx.Workspace)
+		if cloneErr != nil {
+			if unlockErr := lockAttempt.UnlockFn(); unlockErr != nil {
+				ctx.Log.Err("error unlocking state after plan error: %v", unlockErr)
+			}
+			return nil, "", cloneErr
 		}
-		return nil, "", cloneErr
+	} else {
+		waitFn()
+		repoDir, cloneErr = p.WorkingDir.GetWorkingDir(ctx.HeadRepo, ctx.Pull, ctx.Workspace)
+		hasDiverged = false
 	}
 	projAbsPath := filepath.Join(repoDir, ctx.RepoRelDir)
 	if _, err = os.Stat(projAbsPath); os.IsNotExist(err) {
