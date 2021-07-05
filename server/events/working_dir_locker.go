@@ -15,7 +15,6 @@ package events
 
 import (
 	"fmt"
-	"strings"
 	"sync"
 )
 
@@ -50,9 +49,16 @@ type DefaultWorkingDirLocker struct {
 	// locks is a list of the keys that are locked. We then use prefix
 	// matching to determine if something is locked. It's naive but that's okay
 	// because there won't be many locks at one time.
-	locks []string
+	locks []workingDirLock
 
-	commitWaitGroupMap map[string]sync.WaitGroup
+	commitWaitGroupMap map[string]*sync.WaitGroup
+}
+
+type workingDirLock struct {
+	repo string
+	pull int
+	workspace string
+	commit string
 }
 
 // NewDefaultWorkingDirLocker is a constructor.
@@ -66,7 +72,7 @@ func (d *DefaultWorkingDirLocker) TryLockPull(repoFullName string, pullNum int) 
 
 	pullKey := d.pullKey(repoFullName, pullNum)
 	for _, l := range d.locks {
-		if l == pullKey || strings.HasPrefix(l, pullKey+"/") {
+		if l.includes(pullKey) {
 			return func() {}, fmt.Errorf("The Atlantis working dir is currently locked by another" +
 				" command that is running for this pull request.\n" +
 				"Wait until the previous command is complete and try again.")
@@ -85,7 +91,7 @@ func (d *DefaultWorkingDirLocker) TryLock(repoFullName string, pullNum int, work
 	pullKey := d.pullKey(repoFullName, pullNum)
 	workspaceKey := d.workspaceKey(repoFullName, pullNum, workspace)
 	for _, l := range d.locks {
-		if l == pullKey || l == workspaceKey {
+		if l.includes(pullKey) || l.includes(workspaceKey) {
 			return func() {}, fmt.Errorf("The %s workspace is currently locked by another"+
 				" command that is running for this pull request.\n"+
 				"Wait until the previous command is complete and try again.", workspace)
@@ -106,11 +112,11 @@ func (d *DefaultWorkingDirLocker) TryLockWithCommit(repoFullName string, pullNum
 	commitKey := d.commitKey(repoFullName, pullNum, pullHeadCommit, workspace)
 	alreadyLocked := false
 	for _, l := range d.locks {
-		alreadyLocked = l == commitKey
+		alreadyLocked = l.includes(commitKey)
 		if alreadyLocked {
 			break
 		}
-		if l == pullKey || strings.HasPrefix(l, workspaceKey + "@") {
+		if l.includes(pullKey) || l.includes(workspaceKey) {
 			return func() {}, nil, fmt.Errorf("The %s workspace is currently locked by another"+
 				" command that is running for this pull request.\n"+
 				"Wait until the previous command is complete and try again.", workspace)
@@ -118,25 +124,17 @@ func (d *DefaultWorkingDirLocker) TryLockWithCommit(repoFullName string, pullNum
 	}
 	d.locks = append(d.locks, commitKey)
 	if alreadyLocked {
-		wg := d.commitWaitGroupMap[commitKey]
+		wg := d.commitWaitGroupMap[commitKey.String()]
 		return func() {
 			d.unlock(repoFullName, pullNum, workspace)
 		}, func() {
 			wg.Wait()
 		}, nil
 	} else {
-		var wg sync.WaitGroup
-		wg.Add(1)
-		if (d.commitWaitGroupMap == nil) {
-			d.commitWaitGroupMap = make(map[string]sync.WaitGroup)
-		}
-		d.commitWaitGroupMap[commitKey] = wg
+		wg := d.addCommitWaitGroup(commitKey)
 		return func() {
 			d.unlock(repoFullName, pullNum, workspace)
-			wg.Done()
-			d.mutex.Lock()
-			defer d.mutex.Unlock()
-			delete(d.commitWaitGroupMap, commitKey)
+			d.completeCommitWaitGroup(commitKey, wg)
 		}, nil, nil
 	}
 }
@@ -168,10 +166,10 @@ func (d *DefaultWorkingDirLocker) unlockCommit(repoFullName string, pullNum int,
 	d.removeLock(commitKey)
 }
 
-func (d *DefaultWorkingDirLocker) removeLock(key string) {
-	var newLocks []string
+func (d *DefaultWorkingDirLocker) removeLock(key workingDirLock) {
+	var newLocks []workingDirLock
 	for _, l := range d.locks {
-		if l != key {
+		if !l.includes(key) {
 			newLocks = append(newLocks, l)
 			break
 		}
@@ -179,14 +177,68 @@ func (d *DefaultWorkingDirLocker) removeLock(key string) {
 	d.locks = newLocks
 }
 
-func (d *DefaultWorkingDirLocker) workspaceKey(repo string, pull int, workspace string) string {
-	return fmt.Sprintf("%s/%s", d.pullKey(repo, pull), workspace)
+func (d *DefaultWorkingDirLocker) addCommitWaitGroup(commitKey workingDirLock) *sync.WaitGroup {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	if (d.commitWaitGroupMap == nil) {
+		d.commitWaitGroupMap = make(map[string]*sync.WaitGroup)
+	}
+	d.commitWaitGroupMap[commitKey.String()] = &wg
+	return &wg
 }
 
-func (d *DefaultWorkingDirLocker) pullKey(repo string, pull int) string {
-	return fmt.Sprintf("%s/%d", repo, pull)
+func (d *DefaultWorkingDirLocker) completeCommitWaitGroup(commitKey workingDirLock, wg *sync.WaitGroup) {
+	wg.Done()
+
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+	delete(d.commitWaitGroupMap, commitKey.String())
 }
 
-func (d *DefaultWorkingDirLocker) commitKey(repo string, pull int, commit string, workspace string) string {
-	return fmt.Sprintf("%s/%s@%s", d.pullKey(repo, pull), workspace, commit)
+func (d *DefaultWorkingDirLocker) workspaceKey(repo string, pull int, workspace string) workingDirLock {
+	return workingDirLock {
+		repo: repo,
+		pull: pull,
+		workspace: workspace,
+	}
+}
+
+func (d *DefaultWorkingDirLocker) pullKey(repo string, pull int) workingDirLock {
+	return workingDirLock {
+		repo: repo,
+		pull: pull,
+	}
+}
+
+func (d *DefaultWorkingDirLocker) commitKey(repo string, pull int, commit string, workspace string) workingDirLock {
+	return workingDirLock {
+		repo: repo,
+		pull: pull,
+		workspace: workspace,
+		commit: commit,
+	}
+}
+
+func (l *workingDirLock) includes(other workingDirLock) bool {
+	if l.repo != other.repo || l.pull != other.pull {
+		return false
+	}
+	if other.workspace != "" && other.workspace != l.workspace {
+		return false
+	}
+	if other.commit != "" && other.commit != l.commit {
+		return false
+	}
+	return true
+}
+
+func (l *workingDirLock) String() (result string) {
+	result = fmt.Sprintf("%s/%d", l.repo, l.pull)
+	if (l.workspace != "") {
+		result += "/" + l.workspace
+	}
+	if (l.commit != "") {
+		result += "@" + l.commit
+	}
+	return
 }
